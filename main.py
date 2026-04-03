@@ -1,19 +1,32 @@
-import socket
-import threading
-import paramiko
+import html
 import importlib
+import json
 import os
-import sys
 import select
+import socket
+import sys
+import threading
 import time
 import uuid
-import html
-import json
 from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs, urlparse
 
-ALLOW_INSTALL_NODE = False  # Set to True to enable install node
+import paramiko
+
+from _security import (
+    SecurityError,
+    ban_ip,
+    generate_captcha,
+    is_ip_banned,
+    load_banned_ips,
+    scan_module,
+    validate_username,
+    verify_captcha,
+    verify_password,
+)
+
+ALLOW_INSTALL_NODE = False
 
 
 # =========================================================
@@ -35,7 +48,7 @@ class NeedWebInputException(Exception):
 
 
 # =========================================================
-# Host-Key Setup
+# Host Key Setup
 # =========================================================
 
 KEY_FILE = "host.key"
@@ -48,38 +61,91 @@ else:
 
 
 # =========================================================
-# Helpers
+# Node Helpers
 # =========================================================
+
+def get_node_path(module_name):
+    return f"{module_name}.py"
+
 
 def list_nodes():
     """Return node names based on .py files in the current directory."""
     current_script = os.path.splitext(os.path.basename(__file__))[0]
     nodes = []
 
-    for fname in os.listdir("."):
-        if not fname.endswith(".py"):
+    for filename in os.listdir("."):
+        if not filename.endswith(".py"):
             continue
 
-        mod = fname[:-3]
+        module_name = filename[:-3]
 
-        if mod.startswith("_"):
+        if module_name.startswith("_"):
             continue
 
-        if mod == current_script:
+        if module_name == current_script:
             continue
 
-        if mod == "install" and not ALLOW_INSTALL_NODE:
+        if module_name == "install" and not ALLOW_INSTALL_NODE:
             continue
 
-        nodes.append(mod)
+        nodes.append(module_name)
 
     return sorted(nodes)
 
+
+# =========================================================
+# Node Modification Cache
+# =========================================================
+
+_node_file_cache = {}
+_node_file_cache_lock = threading.Lock()
+
+
+def remember_node_mtime(module_name):
+    """Store the current file mtime so unchanged files are not rechecked."""
+    module_file = get_node_path(module_name)
+    if os.path.exists(module_file):
+        with _node_file_cache_lock:
+            _node_file_cache[module_name] = os.path.getmtime(module_file)
+
+
 def load_app(module_name):
-    """Import or reload a node module."""
-    module_file = f"{module_name}.py"
+    """
+    Import or reload a node module.
+
+    Security behavior:
+    - If the file changed since the last successful load, run scan_module().
+    - If the file did not change, skip scanning.
+    - scan_module() itself uses the content-hash cache for fast passes.
+    """
+    module_file = get_node_path(module_name)
     if not os.path.exists(module_file):
         raise FileNotFoundError(f"No such node: {module_name}")
+
+    file_mtime = os.path.getmtime(module_file)
+
+    with _node_file_cache_lock:
+        cached_mtime = _node_file_cache.get(module_name)
+
+        if cached_mtime is None or file_mtime > cached_mtime:
+            print(f"[SECURITY] Checking changed module: {module_file}")
+            try:
+                findings = scan_module(module_file)
+                if findings:
+                    for finding in findings:
+                        print(
+                            f"[SECURITY] {module_file}:{finding['line']} - "
+                            f"{finding['severity']}: {finding['issue']}"
+                        )
+            except SecurityError as e:
+                print(f"\n[FATAL] Security violation in {module_file}")
+                print(f"  {e}")
+                print("\nServer will shut down now for security reasons.")
+                print("=" * 80)
+                sys.exit(3)
+
+            _node_file_cache[module_name] = file_mtime
+            print(f"[OK] {module_file}: security check passed")
 
     if module_name in sys.modules:
         return importlib.reload(sys.modules[module_name])
@@ -109,8 +175,7 @@ class SSHInterface:
             if not raw_char:
                 raise ExitSessionException()
 
-            # ESC or CTRL+C
-            if raw_char in (b"\x1b", b"\x03"):
+            if raw_char in (b"\x1b", b"\x03"):  # ESC or CTRL+C
                 raise ExitSessionException()
 
             char = raw_char.decode("utf-8", errors="ignore")
@@ -121,14 +186,14 @@ class SSHInterface:
                     raise ExitSessionException()
                 return result.strip()
 
-            elif char in ("\x7f", "\x08"):
+            if char in ("\x7f", "\x08"):  # backspace
                 if result:
                     result = result[:-1]
                     self.channel.send(b"\b \b")
+                continue
 
-            else:
-                result += char
-                self.channel.send(char.encode("utf-8"))
+            result += char
+            self.channel.send(char.encode("utf-8"))
 
     def force_answer(self, prompt, error="Input required!\r\n"):
         while True:
@@ -141,7 +206,7 @@ class SSHInterface:
         raise KeepOnlineException(target)
 
     def bridge_to_remote(self, hostname, username, password):
-        """Bridge the current user session to another SSH server."""
+        """Bridge the current session to another SSH server."""
         self.send(f"Connecting to {hostname}...\n")
 
         try:
@@ -154,33 +219,33 @@ class SSHInterface:
                 timeout=10,
             )
 
-            remote_chan = client.invoke_shell()
-            remote_chan.setblocking(0)
+            remote_channel = client.invoke_shell()
+            remote_channel.setblocking(0)
             self.channel.setblocking(0)
 
             while True:
-                read_ready, _, _ = select.select([self.channel, remote_chan], [], [])
+                read_ready, _, _ = select.select([self.channel, remote_channel], [], [])
 
                 if self.channel in read_ready:
                     data = self.channel.recv(1024)
                     if not data:
                         break
-                    remote_chan.send(data)
+                    remote_channel.send(data)
 
-                if remote_chan in read_ready:
-                    data = remote_chan.recv(1024)
+                if remote_channel in read_ready:
+                    data = remote_channel.recv(1024)
                     if not data:
                         break
                     self.channel.send(data)
 
-                if remote_chan.exit_status_ready():
+                if remote_channel.exit_status_ready():
                     break
 
             client.close()
             self.channel.setblocking(1)
 
         except Exception as e:
-            self.send(f"\n[BRIDGE ERROR]: {e}\n")
+            self.send(f"\n[BRIDGE ERROR] {e}\n")
 
 
 # =========================================================
@@ -191,15 +256,52 @@ class SSHRouter(paramiko.ServerInterface):
     def __init__(self):
         self.target = None
         self.event = threading.Event()
+        self.client_ip = None
+
+    def _check_ip_banned(self):
+        if self.client_ip and is_ip_banned(self.client_ip):
+            print(f"[SECURITY] Blocked banned IP: {self.client_ip}")
+            return True
+        return False
+
+    def _validate_and_ban(self, username):
+        is_valid, reason = validate_username(username)
+        if not is_valid:
+            print(f"[SECURITY] Invalid username '{username}' from {self.client_ip}: {reason}")
+            if self.client_ip:
+                ban_ip(self.client_ip, f"Blocked username: {username}")
+            return False
+        return True
 
     def check_auth_none(self, user):
-        if os.path.exists(f"{user}.py"):
+        if self._check_ip_banned():
+            return paramiko.AUTH_FAILED
+
+        if not self._validate_and_ban(user):
+            return paramiko.AUTH_FAILED
+
+        if os.path.exists(get_node_path(user)):
             self.target = user
             return paramiko.AUTH_SUCCESSFUL
+
         return paramiko.AUTH_FAILED
 
-    def check_auth_password(self, user, pwd):
-        return self.check_auth_none(user)
+    def check_auth_password(self, user, password):
+        if self._check_ip_banned():
+            return paramiko.AUTH_FAILED
+
+        if not self._validate_and_ban(user):
+            return paramiko.AUTH_FAILED
+
+        if not verify_password(password):
+            print(f"[SECURITY] Invalid password for '{user}' from {self.client_ip}")
+            return paramiko.AUTH_FAILED
+
+        if os.path.exists(get_node_path(user)):
+            self.target = user
+            return paramiko.AUTH_SUCCESSFUL
+
+        return paramiko.AUTH_FAILED
 
     def get_allowed_auths(self, user):
         return "none,password"
@@ -230,12 +332,12 @@ def cleanup_web_sessions():
     now = time.time()
     with WEB_SESSIONS_LOCK:
         expired = [
-            sid
-            for sid, sess in WEB_SESSIONS.items()
-            if now - sess.get("updated_at", now) > WEB_SESSION_MAX_AGE
+            session_id
+            for session_id, session in WEB_SESSIONS.items()
+            if now - session.get("updated_at", now) > WEB_SESSION_MAX_AGE
         ]
-        for sid in expired:
-            WEB_SESSIONS.pop(sid, None)
+        for session_id in expired:
+            WEB_SESSIONS.pop(session_id, None)
 
 
 def create_web_session(node_name):
@@ -256,10 +358,10 @@ def get_web_session(session_id):
         return None
 
     with WEB_SESSIONS_LOCK:
-        sess = WEB_SESSIONS.get(session_id)
-        if sess:
-            sess["updated_at"] = time.time()
-        return sess
+        session = WEB_SESSIONS.get(session_id)
+        if session:
+            session["updated_at"] = time.time()
+        return session
 
 
 def delete_web_session(session_id):
@@ -268,7 +370,7 @@ def delete_web_session(session_id):
 
 
 # =========================================================
-# Replay-based Auto Web Connection
+# Replay-Based Auto Web Connection
 # =========================================================
 
 class ReplayWebConnection:
@@ -290,11 +392,7 @@ class ReplayWebConnection:
         if not text:
             return
 
-        if (
-            self.events
-            and self.events[-1]["role"] == role
-            and role in ("output", "error", "meta")
-        ):
+        if self.events and self.events[-1]["role"] == role and role in ("output", "error", "meta"):
             self.events[-1]["text"] += text
         else:
             self.events.append({"role": role, "text": text})
@@ -321,9 +419,9 @@ class ReplayWebConnection:
 
     def force_answer(self, prompt, error="Input required!\n"):
         while True:
-            res = self.answer(prompt)
-            if res:
-                return res
+            result = self.answer(prompt)
+            if result:
+                return result
             self.send(error)
 
     def keeponline(self, target=None):
@@ -341,7 +439,7 @@ def replay_node_for_web(node_name, answers):
     Replay node_name.run(conn) using stored answers.
     This works well for deterministic prompt/response flows.
     """
-    conn = ReplayWebConnection(answers)
+    connection = ReplayWebConnection(answers)
     current_handler = "run"
 
     while True:
@@ -349,44 +447,42 @@ def replay_node_for_web(node_name, answers):
             app = load_app(node_name)
 
             if not hasattr(app, current_handler):
-                raise AttributeError(
-                    f"Node '{node_name}' has no handler '{current_handler}'"
-                )
+                raise AttributeError(f"Node '{node_name}' has no handler '{current_handler}'")
 
-            getattr(app, current_handler)(conn)
+            getattr(app, current_handler)(connection)
 
             return {
-                "events": conn.events,
+                "events": connection.events,
                 "pending_prompt": None,
                 "complete": True,
                 "error": None,
             }
 
-        except KeepOnlineException as k:
-            current_handler = k.target or "run"
+        except KeepOnlineException as e:
+            current_handler = e.target or "run"
             continue
 
-        except NeedWebInputException as n:
+        except NeedWebInputException as e:
             return {
-                "events": conn.events,
-                "pending_prompt": str(n.prompt),
+                "events": connection.events,
+                "pending_prompt": str(e.prompt),
                 "complete": False,
                 "error": None,
             }
 
         except ExitSessionException:
-            conn._push("meta", "\n[session closed]\n")
+            connection._push("meta", "\n[session closed]\n")
             return {
-                "events": conn.events,
+                "events": connection.events,
                 "pending_prompt": None,
                 "complete": True,
                 "error": None,
             }
 
         except Exception as e:
-            conn._push("error", f"{type(e).__name__}: {e}")
+            connection._push("error", f"{type(e).__name__}: {e}")
             return {
-                "events": conn.events,
+                "events": connection.events,
                 "pending_prompt": None,
                 "complete": True,
                 "error": str(e),
@@ -465,7 +561,7 @@ class WebInterface:
 
 
 # =========================================================
-# Pretty HTML Renderer
+# HTML Rendering
 # =========================================================
 
 def _fmt(text):
@@ -575,35 +671,30 @@ code {{
 def render_auto_node_page(node_name, view):
     events_html = []
 
-    for ev in view["events"]:
-        role = ev["role"]
-        text = ev["text"]
+    for event in view["events"]:
+        role = event["role"]
+        text = event["text"]
 
         if role == "output":
-            cls = "bubble output"
+            css_class = "bubble output"
             label = "output"
-            content = _fmt(text)
         elif role == "prompt":
-            cls = "bubble prompt"
+            css_class = "bubble prompt"
             label = "prompt"
-            content = _fmt(text)
         elif role == "input":
-            cls = "bubble input"
+            css_class = "bubble input"
             label = "you"
-            content = _fmt(text)
         elif role == "error":
-            cls = "bubble error"
+            css_class = "bubble error"
             label = "error"
-            content = _fmt(text)
         else:
-            cls = "bubble meta"
+            css_class = "bubble meta"
             label = "info"
-            content = _fmt(text)
 
         events_html.append(f"""
-        <div class="{cls}">
+        <div class="{css_class}">
             <div class="label">{label}</div>
-            <div class="content">{content}</div>
+            <div class="content">{_fmt(text)}</div>
         </div>
         """)
 
@@ -853,7 +944,7 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
         cleanup_web_sessions()
 
         parsed = urlparse(self.path)
-        parts = [p for p in parsed.path.strip("/").split("/") if p]
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
 
         if not parts:
             self._send_html(200, render_index_page())
@@ -861,7 +952,7 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
 
         node_name = parts[0]
 
-        if not os.path.exists(f"{node_name}.py"):
+        if not os.path.exists(get_node_path(node_name)):
             self._send_text(404, "Node not found")
             return
 
@@ -871,16 +962,15 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
             self._send_text(500, f"Module load error: {e}")
             return
 
-        # Custom handler wins
         if hasattr(app, "handle_web") or hasattr(app, "web"):
-            req = WebInterface(self, node_name)
+            request = WebInterface(self, node_name)
 
             try:
                 if hasattr(app, "handle_web"):
-                    app.handle_web(req)
+                    app.handle_web(request)
                     return
 
-                result = app.web(req)
+                result = app.web(request)
 
                 if result is None:
                     return
@@ -904,7 +994,6 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
                 self._send_text(500, f"Custom web handler error: {e}")
                 return
 
-        # Automatic fallback
         session, new_cookie = self._get_or_create_session(node_name)
 
         if self.command == "POST":
@@ -1004,7 +1093,7 @@ class NodeHTTPHandler(BaseHTTPRequestHandler):
 
 
 # =========================================================
-# SSH Client Handler
+# SSH Client Handling
 # =========================================================
 
 def handle_client(client_socket, addr):
@@ -1013,6 +1102,7 @@ def handle_client(client_socket, addr):
         transport.add_server_key(HOST_KEY)
 
         server = SSHRouter()
+        server.client_ip = addr[0]
         transport.start_server(server=server)
 
         channel = transport.accept(20)
@@ -1025,6 +1115,34 @@ def handle_client(client_socket, addr):
 
         print(f"[*] {addr[0]} logged in as '{server.target}'")
 
+        captcha_code, captcha_art = generate_captcha()
+
+        connection.send("\r\n" + "=" * 70 + "\r\n")
+        connection.send(" SECURITY CHECK - CAPTCHA REQUIRED\r\n")
+        connection.send("=" * 70 + "\r\n\r\n")
+
+        for line in captcha_art:
+            connection.send(f"  {line}\r\n")
+
+        connection.send("\r\n")
+        connection.send("  Please enter the code shown above:\r\n")
+        connection.send("  (Case-insensitive)\r\n\r\n")
+
+        for attempt in range(3):
+            user_input = connection.answer("  Captcha: ")
+
+            if verify_captcha(user_input, captcha_code):
+                connection.send("\r\n[OK] Captcha accepted. Access granted.\r\n\r\n")
+                break
+
+            remaining = 2 - attempt
+            if remaining > 0:
+                connection.send(f"\r\n[ERROR] Incorrect code. {remaining} attempt(s) remaining.\r\n")
+            else:
+                connection.send("\r\n[ERROR] Too many failed attempts. Closing connection.\r\n")
+                channel.close()
+                return
+
         while True:
             try:
                 app = load_app(server.target)
@@ -1036,15 +1154,15 @@ def handle_client(client_socket, addr):
 
                 break
 
-            except KeepOnlineException as k:
-                state = k.target
+            except KeepOnlineException as e:
+                state = e.target
                 continue
 
             except ExitSessionException:
                 break
 
             except Exception as e:
-                print(f"[!] {addr[0]} error: {e}")
+                print(f"[ERROR] {addr[0]} session error: {e}")
                 break
 
         channel.close()
@@ -1090,7 +1208,70 @@ def run_web_server(host="0.0.0.0", port=8080):
     httpd.serve_forever()
 
 
+# =========================================================
+# Startup Security Validation
+# =========================================================
+
+def run_startup_security_checks():
+    print("\n[SECURITY] Running startup security checks...")
+
+    required_names = ("scan_module", "validate_username", "ban_ip")
+    missing = [name for name in required_names if name not in globals()]
+    if missing:
+        print("\n[FATAL] Security module is incomplete or corrupted.")
+        print(f"Missing required symbols: {', '.join(missing)}")
+        print("The server cannot start without mandatory security checks.")
+        sys.exit(1)
+
+    banned_ips = load_banned_ips()
+    print(f"[OK] Loaded {len(banned_ips)} banned IP(s)")
+
+    nodes = list_nodes()
+    print(f"[SECURITY] Scanning {len(nodes)} node module(s)...")
+
+    failed_nodes = []
+
+    for node in nodes:
+        module_file = get_node_path(node)
+        try:
+            findings = scan_module(module_file)
+
+            if findings:
+                for finding in findings:
+                    print(
+                        f"[SECURITY] {module_file}:{finding['line']} - "
+                        f"{finding['severity']}: {finding['issue']}"
+                    )
+
+            remember_node_mtime(node)
+            print(f"[OK] {module_file}: security check passed")
+
+        except SecurityError as e:
+            failed_nodes.append((node, str(e)))
+            print(f"[BLOCKED] {module_file}: security check failed")
+
+    if failed_nodes:
+        print("\n" + "=" * 80)
+        print("[FATAL] One or more nodes failed the security check.")
+        print("=" * 80)
+        for node, error in failed_nodes:
+            print(f"\nNode: {node}")
+            print(error)
+        print("\n" + "=" * 80)
+        print("The server will not start until all security issues are fixed.")
+        print("=" * 80)
+        sys.exit(2)
+
+    print("\n[OK] All nodes passed startup security checks.")
+
+
+# =========================================================
+# Main
+# =========================================================
+
 def main():
+    run_startup_security_checks()
+
     threading.Thread(
         target=run_web_server,
         kwargs={"host": "0.0.0.0", "port": 8080},

@@ -1,0 +1,5 @@
+{
+    "server_password": "changeme",
+    "allow_anonymous": false,
+    "description": "Change 'server_password' to your desired password. Set 'allow_anonymous' to true to disable password requirement."
+}
