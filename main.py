@@ -13,6 +13,8 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
+ALLOW_INSTALL_NODE = False  # Set to True to enable install node
+
 
 # =========================================================
 # Custom Exceptions
@@ -66,10 +68,12 @@ def list_nodes():
         if mod == current_script:
             continue
 
+        if mod == "install" and not ALLOW_INSTALL_NODE:
+            continue
+
         nodes.append(mod)
 
     return sorted(nodes)
-
 
 def load_app(module_name):
     """Import or reload a node module."""
